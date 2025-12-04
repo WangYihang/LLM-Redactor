@@ -7,12 +7,15 @@ import (
 
 	"github.com/WangYihang/http-grab/pkg/model"
 	"github.com/alecthomas/kong"
+	"github.com/rs/zerolog"
 	"github.com/wangyihang/llm-prism/pkg/llms/providers"
+	"github.com/wangyihang/llm-prism/pkg/logging"
 	"github.com/wangyihang/llm-prism/pkg/version"
 )
 
 type CLI struct {
-	Run struct {
+	LogFile string `help:"The log file path." env:"LLM_PRISM_LOG_FILE" default:"llm-prism.jsonl"`
+	Run     struct {
 		ApiURL string `help:"The API base URL." env:"LLM_PRISM_API_URL" default:"https://api.deepseek.com/anthropic"`
 		ApiKey string `help:"The API key." env:"LLM_PRISM_API_KEY" required:""`
 		Host   string `help:"The host to listen on." env:"LLM_PRISM_HOST" default:"0.0.0.0"`
@@ -30,15 +33,28 @@ func main() {
 		kong.UsageOnError(),
 	)
 
+	logger := logging.GetLogger(cli.LogFile)
+
 	switch ctx.Command() {
 	case "run":
-		runProxy(cli.Run.ApiURL, cli.Run.ApiKey, cli.Run.Host, cli.Run.Port)
+		logger.Info().
+			Str("api_url", cli.Run.ApiURL).
+			Str("host", cli.Run.Host).
+			Int("port", cli.Run.Port).
+			Str("log_file", cli.LogFile).
+			Msg("starting proxy server")
+		runProxy(logger, cli.Run.ApiURL, cli.Run.ApiKey, cli.Run.Host, cli.Run.Port)
 	case "version":
+		logger.Info().
+			Str("version", version.GetVersionInfo().Version).
+			Str("commit", version.GetVersionInfo().Commit).
+			Str("date", version.GetVersionInfo().Date).
+			Msg("version information")
 		fmt.Println(version.GetVersionInfo().JSON())
 	}
 }
 
-func runProxy(apiURL, apiKey, host string, port int) {
+func runProxy(logger zerolog.Logger, apiURL, apiKey, host string, port int) {
 	deepseekProvider := providers.NewDeepseekProvider(apiURL, apiKey)
 	proxy := httputil.NewSingleHostReverseProxy(deepseekProvider.Target())
 	originalDirector := proxy.Director
@@ -47,29 +63,29 @@ func runProxy(apiURL, apiKey, host string, port int) {
 		req = deepseekProvider.Director(req)
 		httpRequest, err := model.NewHTTPRequest(req)
 		if err != nil {
-			fmt.Println(">>>> error: ", err)
+			logger.Error().Err(err).Msg("failed to create HTTP request model")
 			return
 		}
-		fmt.Println(">>>> request: ", httpRequest)
+		logger.Info().Interface("request", httpRequest).Msg("incoming request")
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		dump, _ := httputil.DumpResponse(resp, true)
-		fmt.Println(">>>> response: ", string(dump))
+		logger.Debug().Str("response_dump", string(dump)).Msg("response dump")
 		httpResponse, err := model.NewHTTPResponse(resp)
 		if err != nil {
-			fmt.Println(">>>> error: ", err)
+			logger.Error().Err(err).Msg("failed to create HTTP response model")
 			return nil
 		}
-		fmt.Println(">>>> response: ", httpResponse)
+		logger.Info().Interface("response", httpResponse).Msg("outgoing response")
 		return nil
 	}
 	addr := fmt.Sprintf("%s:%d", host, port)
-	fmt.Printf("Starting proxy server on %s\n", addr)
+	logger.Info().Str("address", addr).Msg("proxy server started")
 	err := http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxy.ServeHTTP(w, r)
 	}))
 	if err != nil {
-		fmt.Println(">>>> error: ", err)
+		logger.Error().Err(err).Msg("failed to start proxy server")
 		return
 	}
 }
