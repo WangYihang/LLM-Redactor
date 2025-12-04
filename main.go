@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
+	"time"
 
 	"github.com/alecthomas/kong"
 	"github.com/rs/zerolog"
@@ -54,6 +60,53 @@ func main() {
 	}
 }
 
+type responseCapture struct {
+	http.ResponseWriter
+	body       *bytes.Buffer
+	statusCode int
+}
+
+func (w *responseCapture) Write(b []byte) (int, error) {
+	w.body.Write(b)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *responseCapture) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseCapture) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func decodeBody(data []byte, header http.Header) string {
+
+	contentEncoding := header.Get("Content-Encoding")
+
+	if strings.Contains(contentEncoding, "gzip") {
+		reader, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+
+			return fmt.Sprintf("<gzip_decode_error: %v>", err)
+		}
+		defer func() {
+			if err := reader.Close(); err != nil {
+				slog.Error("failed to close gzip reader", "error", err)
+			}
+		}()
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			return fmt.Sprintf("<gzip_read_error: %v>", err)
+		}
+		return string(decoded)
+	}
+
+	return string(data)
+}
+
 func runProxy(logger zerolog.Logger, apiURL, apiKey, host string, port int) {
 	baseURL, err := url.Parse(apiURL)
 	if err != nil {
@@ -63,18 +116,45 @@ func runProxy(logger zerolog.Logger, apiURL, apiKey, host string, port int) {
 	deepseekProvider := providers.NewDeepseekProvider(baseURL, apiKey)
 	proxy := httputil.NewSingleHostReverseProxy(deepseekProvider.BaseURL)
 	originalDirector := proxy.Director
+
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
 		deepseekProvider.Director(req)
 	}
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		return nil
-	}
+
 	addr := fmt.Sprintf("%s:%d", host, port)
 	logger.Info().Str("address", addr).Msg("proxy server started")
+
 	err = http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		proxy.ServeHTTP(w, r)
+		start := time.Now()
+
+		reqBuf := new(bytes.Buffer)
+		r.Body = io.NopCloser(io.TeeReader(r.Body, reqBuf))
+
+		resCapture := &responseCapture{
+			ResponseWriter: w,
+			body:           new(bytes.Buffer),
+			statusCode:     200,
+		}
+
+		proxy.ServeHTTP(resCapture, r)
+
+		respHeader := resCapture.Header()
+
+		respBodyStr := decodeBody(resCapture.body.Bytes(), respHeader)
+
+		reqBodyStr := decodeBody(reqBuf.Bytes(), r.Header)
+
+		logger.Info().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Int("status", resCapture.statusCode).
+			Dur("duration", time.Since(start)).
+			Str("request_body", reqBodyStr).
+			Str("response_body", respBodyStr).
+			Msg("http interaction")
 	}))
+
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to start proxy server")
 		return
