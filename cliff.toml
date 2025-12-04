@@ -14,7 +14,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
     {% for commit in commits %}
-        - [`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/<REPO>/commit/{{ commit.id }}): \
+        - [`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ get_env(name="GITHUB_REPOSITORY", default="orhun/git-cliff") }}/commit/{{ commit.id }}): \
             {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
             {% if commit.breaking %}[**breaking**] {% endif %}\
             {{ commit.message | upper_first }} \
@@ -28,7 +28,6 @@ trim = true
 render_always = true
 # An array of regex based postprocessors to modify the changelog.
 postprocessors = [
-    { pattern = '<REPO>', replace = "https://github.com/wangyihang/llm-prism" },
     { pattern = "Yihang Wang", replace = "wangyihang" },
 ]
 # render body even when there are no releases to process
