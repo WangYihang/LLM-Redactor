@@ -21,13 +21,15 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: stable
+      - name: Create dist directory
+        run: mkdir -p dist
       - name: Generate a changelog
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --verbose
         env:
-          OUTPUT: CHANGELOG.md
+          OUTPUT: dist/CHANGELOG.md
           GITHUB_REPO: ${{ github.repository }}
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -42,6 +44,6 @@ jobs:
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --release-notes=CHANGELOG.md
+          args: release --clean --release-notes=dist/CHANGELOG.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
