@@ -25,7 +25,7 @@ jobs:
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
-          args: --verbose --output CHANGELOG.md
+          args: --latest --strip header --output CHANGELOG.md
         env:
           GITHUB_REPO: ${{ github.repository }}
       - name: Login to GitHub Container Registry
