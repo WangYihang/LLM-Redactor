@@ -40,3 +40,6 @@ CHANGELOG.md
 
 # Log files
 *.jsonl
+
+# Rules
+redactor_rules.toml
