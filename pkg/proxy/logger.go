@@ -32,7 +32,12 @@ func EnrichLogEvent(e *zerolog.Event, b []byte, h http.Header, sysLog zerolog.Lo
 	e.Array("headers", arr)
 
 	if json.Valid(b) {
-		e.RawJSON("body", b)
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, b); err == nil {
+			e.RawJSON("body", compact.Bytes())
+		} else {
+			e.Str("body", string(b))
+		}
 	} else {
 		e.Str("body", string(b))
 	}

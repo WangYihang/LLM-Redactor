@@ -28,7 +28,7 @@ func TestEnrichLogEvent(t *testing.T) {
 	evt.Msg("test")
 
 	out := buf.String()
-	if !strings.Contains(out, `"body":{"hello": "world"}`) {
+	if !strings.Contains(out, `"body":{"hello":"world"}`) {
 		t.Errorf("Expected body to be raw JSON, got %s", out)
 	}
 	if !strings.Contains(out, `"name":"Content-Type"`) || !strings.Contains(out, `"value":"application/json"`) {
@@ -58,7 +58,7 @@ func TestEnrichLogEvent(t *testing.T) {
 	evt2.Msg("test gz")
 
 	out2 := buf.String()
-	if !strings.Contains(out2, `"body":{"gzipped": true}`) {
+	if !strings.Contains(out2, `"body":{"gzipped":true}`) {
 		t.Errorf("Expected decompressed json body, got %s", out2)
 	}
 }
