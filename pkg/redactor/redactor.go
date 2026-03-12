@@ -35,6 +35,10 @@ func New(configPath string, logs zerolog.Logger) (*Redactor, error) {
 
 	var compatibleRules []Rule
 	for _, rule := range config.Rules {
+		// Skip rules without regex (e.g., path-only rules from Gitleaks)
+		if rule.RawRegex == "" {
+			continue
+		}
 		// Go's regexp engine doesn't support lookaround (?!, ?=, ?<)
 		if strings.Contains(rule.RawRegex, "?<") || strings.Contains(rule.RawRegex, "?=") || strings.Contains(rule.RawRegex, "?!") {
 			continue
