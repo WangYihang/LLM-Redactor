@@ -2,7 +2,6 @@ package redactor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	gitleaksconfig "github.com/zricethezav/gitleaks/v8/config"
 
+	"github.com/goccy/go-json"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/rs/zerolog"
 	"github.com/wangyihang/llm-prism/pkg/redactor/detectors"
@@ -20,7 +20,7 @@ import (
 
 const (
 	RedactedPlaceholder = "REDACTED_SECRET"
-	eventChannelSize    = 256
+	eventChannelSize    = 1024
 )
 
 // detectionEvent captures all info needed to log a single detection asynchronously.
@@ -223,8 +223,9 @@ func (r *Redactor) RedactContent(ctx context.Context, content string) string {
 				}
 			}
 
-			// Send detection event to background processor
-			r.eventCh <- detectionEvent{
+			// Send detection event to background processor non-blocking
+			select {
+			case r.eventCh <- detectionEvent{
 				DetectorType: detector.Type(),
 				RuleID:       ruleID,
 				Description:  description,
@@ -234,6 +235,10 @@ func (r *Redactor) RedactContent(ctx context.Context, content string) string {
 				Host:         ctxkeys.GetString(ctx, ctxkeys.Host),
 				Path:         ctxkeys.GetString(ctx, ctxkeys.Path),
 				Method:       ctxkeys.GetString(ctx, ctxkeys.Method),
+			}:
+			default:
+				// Channel is full, effectively dropping the event metric to prioritize proxy stability
+				r.logs.Warn().Msg("Detection event channel full, dropping detection metric.")
 			}
 
 			return RedactedPlaceholder

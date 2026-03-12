@@ -105,10 +105,13 @@ func New(rdr ContentRedactor, sysLog, sysFileLog, trafficLog zerolog.Logger, ses
 			// For streaming responses, we do not read or buffer the body to maintain true zero-latency.
 			// We only read normal, discrete responses to log them.
 			if !isStream {
+				const maxLogSize = 1024 * 1024 // 1 MB limit for logging
+				limitReader := io.LimitReader(resp.Body, maxLogSize)
 				var err error
-				responseBody, err = io.ReadAll(resp.Body)
+				responseBody, err = io.ReadAll(limitReader)
 				if err == nil {
-					resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+					// Stitch the unread part back with the read part to avoid breaking the client.
+					resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(responseBody), resp.Body))
 				}
 			}
 		}
