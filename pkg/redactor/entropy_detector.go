@@ -24,6 +24,10 @@ var (
 	envVarRegex = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
 )
 
+func (d *EntropyDetector) Type() string {
+	return "entropy"
+}
+
 func (d *EntropyDetector) Redact(content string, callback RedactionCallback) string {
 	return d.regex.ReplaceAllStringFunc(content, func(match string) string {
 		if len(match) < d.minLen {

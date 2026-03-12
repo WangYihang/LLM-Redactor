@@ -8,6 +8,10 @@ func NewRegexDetector(rules []Rule) *RegexDetector {
 	return &RegexDetector{rules: rules}
 }
 
+func (d *RegexDetector) Type() string {
+	return "regex"
+}
+
 func (d *RegexDetector) Redact(content string, callback RedactionCallback) string {
 	for _, rule := range d.rules {
 		content = rule.Regex.ReplaceAllStringFunc(content, func(match string) string {

@@ -67,7 +67,7 @@ func StartProxy(cli *config.CLI, logs *logging.Loggers, host string, port int, a
 			resEvt := zerolog.Dict().Int("status", sw.Code)
 			proxy.EnrichLogEvent(resEvt, sw.Buf.Bytes(), sw.Header(), logs.System)
 
-			logs.Data.Info().
+			logs.Traffic.Info().
 				Str("id", requestID).
 				Dur("duration", time.Since(t)).
 				Dict("http", zerolog.Dict().Dict("request", reqEvt).Dict("response", resEvt)).

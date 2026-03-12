@@ -24,7 +24,7 @@ func TestShannonEntropy(t *testing.T) {
 
 func TestEntropyDetector(t *testing.T) {
 	d := NewEntropyDetector(3.5, 24)
-	content := "export ANTHROPIC_AUTH_TOKEN=sk-123178392719837218937821637216327"
+	content := "export ANTHROPIC_AUTH_TOKEN=sk-534213430b2ee4cc29ace0eecb7d3363e"
 	redacted := d.Redact(content, func(match, ruleID, description string) string {
 		return "[REDACTED]"
 	})

@@ -128,6 +128,7 @@ func (r *Redactor) RedactContent(content string, context map[string]string) stri
 
 			// LOG DETECTION
 			evt := r.logs.Info().
+				Str("detector_type", detector.Type()).
 				Str("rule_id", ruleID).
 				Str("description", description).
 				Str("masked_content", mask(match)).
