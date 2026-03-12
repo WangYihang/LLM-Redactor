@@ -128,10 +128,11 @@ func (r *Redactor) RedactRequest(body []byte, context map[string]string) ([]byte
 
 // StreamRedactor implements a sliding window redactor for SSE streams
 type StreamRedactor struct {
-	r       *Redactor
-	buffer  []byte
-	maxLen  int
-	context map[string]string
+	r             *Redactor
+	maxLen        int
+	context       map[string]string
+	buffer        string
+	templateEvent map[string]interface{}
 }
 
 func NewStreamRedactor(r *Redactor, windowSize int, context map[string]string) *StreamRedactor {
@@ -145,49 +146,87 @@ func NewStreamRedactor(r *Redactor, windowSize int, context map[string]string) *
 	}
 }
 
-func (sr *StreamRedactor) extractAndRedact(v interface{}) string {
+func (sr *StreamRedactor) extractAndClearContent(v interface{}) string {
 	switch val := v.(type) {
 	case string:
-		return sr.r.RedactContent(val, sr.context)
+		return val
 	case map[string]interface{}:
 		var fullContent string
 		for k, v := range val {
 			if k == "content" || k == "text" || k == "thinking" {
 				if s, ok := v.(string); ok {
-					redacted := sr.r.RedactContent(s, sr.context)
-					val[k] = redacted
-					fullContent += redacted
+					fullContent += s
+					val[k] = "" // clear it to use as template
 				} else {
-					fullContent += sr.extractAndRedact(v)
+					fullContent += sr.extractAndClearContent(v)
 				}
 			} else {
-				sr.extractAndRedact(v)
+				fullContent += sr.extractAndClearContent(v)
 			}
 		}
 		return fullContent
 	case []interface{}:
 		var fullContent string
-		for i, v := range val {
-			fullContent += sr.extractAndRedact(v)
-			val[i] = sr.redactRecursive(v)
+		for _, v := range val {
+			fullContent += sr.extractAndClearContent(v)
 		}
 		return fullContent
 	}
 	return ""
 }
 
-func (sr *StreamRedactor) redactRecursive(v interface{}) interface{} {
-	return sr.r.RedactValue(v, sr.context)
+func (sr *StreamRedactor) setContent(v interface{}, text string) bool {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		for k, v := range val {
+			if k == "content" || k == "text" || k == "thinking" {
+				if _, ok := v.(string); ok {
+					val[k] = text
+					return true
+				}
+			}
+			if sr.setContent(v, text) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, v := range val {
+			if sr.setContent(v, text) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (sr *StreamRedactor) emitTemplate(text string) []byte {
+	if sr.templateEvent == nil {
+		return nil
+	}
+	sr.setContent(sr.templateEvent, text)
+	sr.r.RedactValue(sr.templateEvent, sr.context)
+	newRaw, _ := json.Marshal(sr.templateEvent)
+	return append([]byte("data: "), newRaw...)
 }
 
 // RedactSSELine processes a single "data: ..." line
 func (sr *StreamRedactor) RedactSSELine(line []byte) []byte {
-	if !bytes.HasPrefix(line, []byte("data: ")) {
+	hasNewline := bytes.HasSuffix(line, []byte("\n"))
+	cleanLine := bytes.TrimSpace(line)
+
+	if !bytes.HasPrefix(cleanLine, []byte("data: ")) {
 		return line
 	}
 
-	rawData := bytes.TrimPrefix(line, []byte("data: "))
+	rawData := bytes.TrimPrefix(cleanLine, []byte("data: "))
 	if string(rawData) == "[DONE]" {
+		flushed := sr.Flush()
+		if len(flushed) > 0 {
+			if hasNewline {
+				flushed = append(flushed, '\n')
+			}
+			return append(flushed, line...)
+		}
 		return line
 	}
 
@@ -196,32 +235,64 @@ func (sr *StreamRedactor) RedactSSELine(line []byte) []byte {
 		return line
 	}
 
-	// Use recursive extraction and redaction
-	content := sr.extractAndRedact(data)
+	content := sr.extractAndClearContent(data)
+
 	if content == "" {
-		return line
+		flushed := sr.Flush()
+		sr.r.RedactValue(data, sr.context)
+		newRaw, _ := json.Marshal(data)
+		out := append([]byte("data: "), newRaw...)
+		if hasNewline {
+			out = append(out, '\n')
+		}
+		if len(flushed) > 0 {
+			if hasNewline {
+				flushed = append(flushed, '\n')
+			}
+			return append(flushed, out...)
+		}
+		return out
 	}
 
-	sr.buffer = append(sr.buffer, []byte(content)...)
-
-	if len(sr.buffer) < sr.maxLen {
-		sr.r.RedactValue(data, sr.context)
-		sr.buffer = []byte(sr.r.RedactContent(string(sr.buffer), sr.context))
-	} else {
-		toFlush := len(sr.buffer) - sr.maxLen
-		sr.buffer = sr.buffer[toFlush:]
-		sr.r.RedactValue(data, sr.context)
+	sr.buffer += content
+	if sr.templateEvent == nil {
+		sr.templateEvent = data
 	}
 
-	newRawData, _ := json.Marshal(data)
-	return append([]byte("data: "), newRawData...)
+	redacted := sr.r.RedactContent(sr.buffer, sr.context)
+	if redacted != sr.buffer {
+		out := sr.emitTemplate(redacted)
+		sr.buffer = ""
+		sr.templateEvent = nil
+		if hasNewline {
+			out = append(out, '\n')
+		}
+		return out
+	}
+
+	if len(sr.buffer) > sr.maxLen {
+		safeLen := len(sr.buffer) - sr.maxLen
+		safeText := sr.buffer[:safeLen]
+		sr.buffer = sr.buffer[safeLen:]
+		out := sr.emitTemplate(safeText)
+		// Use the latest data structure as the new template for accurate outer fields (e.g. usage stats if any)
+		sr.templateEvent = data
+		if hasNewline {
+			out = append(out, '\n')
+		}
+		return out
+	}
+
+	return nil
 }
 
 func (sr *StreamRedactor) Flush() []byte {
-	if len(sr.buffer) == 0 {
+	if sr.buffer == "" {
 		return nil
 	}
-	redacted := sr.r.RedactContent(string(sr.buffer), sr.context)
-	sr.buffer = nil
-	return []byte(redacted)
+	redacted := sr.r.RedactContent(sr.buffer, sr.context)
+	out := sr.emitTemplate(redacted)
+	sr.buffer = ""
+	sr.templateEvent = nil
+	return out
 }

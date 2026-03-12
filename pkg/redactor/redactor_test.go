@@ -2,6 +2,7 @@ package redactor
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -111,5 +112,79 @@ func TestDetectionLogging(t *testing.T) {
 	output := buf.String()
 	if !strings.Contains(output, "log-rule") || !strings.Contains(output, "ctx_val") {
 		t.Errorf("Audit log incomplete: %s", output)
+	}
+}
+
+func TestStreamRedactorEdgeCases(t *testing.T) {
+	r := &Redactor{
+		config: &Config{
+			Rules: []Rule{
+				{ID: "edge-secret", RawRegex: "MY_PASSWORD"},
+			},
+		},
+		logs: zerolog.Nop(),
+	}
+	_ = r.config.Rules[0].Compile()
+
+	sr := NewStreamRedactor(r, 10, nil)
+
+	// Test non-data line
+	nonData := []byte("invalid line\n")
+	if !bytes.Equal(sr.RedactSSELine(nonData), nonData) {
+		t.Error("Should return non-data line untouched")
+	}
+
+	// Test DONE line without pending data
+	doneLine := []byte("data: [DONE]\n")
+	if !bytes.Equal(sr.RedactSSELine(doneLine), doneLine) {
+		t.Error("Should return DONE line untouched if no pending")
+	}
+
+	// Test DONE line with pending data
+	sr.RedactSSELine([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"MY_\"}}]}\n"))
+	outDone := sr.RedactSSELine(doneLine)
+	if !strings.Contains(string(outDone), "MY_") || !strings.Contains(string(outDone), "[DONE]") {
+		t.Error("Should flush pending data before DONE")
+	}
+
+	// Test empty content
+	sr = NewStreamRedactor(r, 10, nil)
+	sr.RedactSSELine([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"MY_\"}}]}\n"))
+	emptyContentLine := []byte("data: {\"choices\":[{\"delta\":{}}]}\n")
+	outEmpty := sr.RedactSSELine(emptyContentLine)
+	if !strings.Contains(string(outEmpty), "MY_") || !strings.Contains(string(outEmpty), "delta\":{}") {
+		t.Error("Should flush pending before empty content line")
+	}
+
+	// Test invalid JSON
+	invalidJSON := []byte("data: {invalid\n")
+	if !bytes.Equal(sr.RedactSSELine(invalidJSON), invalidJSON) {
+		t.Error("Should return invalid JSON line untouched")
+	}
+
+	// Test RedactValue recursively
+	val := sr.r.RedactValue([]interface{}{"A_MY_PASSWORD_B", map[string]interface{}{"key": "MY_PASSWORD"}}, nil)
+	valJSON, _ := json.Marshal(val)
+	if strings.Contains(string(valJSON), "MY_PASSWORD") {
+		t.Errorf("RedactValue failed to redact recursively: %s", string(valJSON))
+	}
+
+	// Test Config load fallback (JSON instead of TOML)
+	jsonConfig := `{"rules": [{"id": "json-rule", "description": "desc", "regex": "JSON_SECRET"}]}`
+	tmpFile := "test_rules.json"
+	_ = os.WriteFile(tmpFile, []byte(jsonConfig), 0644)
+	defer func() { _ = os.Remove(tmpFile) }()
+	r2, err := New(tmpFile, zerolog.Nop())
+	if err != nil || len(r2.config.Rules) != 1 {
+		t.Errorf("Failed to load JSON config: %v", err)
+	}
+}
+
+func TestRedactorMask(t *testing.T) {
+	if mask("1234567") != "****" {
+		t.Errorf("Short mask failed")
+	}
+	if mask("123456789") != "1234...6789" {
+		t.Errorf("Long mask failed")
 	}
 }
