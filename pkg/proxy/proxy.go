@@ -21,8 +21,6 @@ type proxyLogWriter struct {
 }
 
 func (w *proxyLogWriter) Write(p []byte) (n int, err error) {
-	msg := strings.TrimSpace(string(p))
-	w.logger.Info().Msg("[goproxy_debug] " + msg)
 	return len(p), nil
 }
 
