@@ -134,10 +134,6 @@ func (r *Redactor) Summary() string {
 		Headers("Request ID", "Detector", "Rule ID", "Masked Value")
 
 	for _, d := range details {
-		reqIDShort := d.RequestID
-		if len(reqIDShort) > 16 {
-			reqIDShort = reqIDShort[:16]
-		}
 		ruleIDShort := d.RuleID
 		if len(ruleIDShort) > 29 {
 			ruleIDShort = ruleIDShort[:26] + "..."
@@ -146,7 +142,7 @@ func (r *Redactor) Summary() string {
 		if len(maskedShort) > 16 {
 			maskedShort = maskedShort[:13] + "..."
 		}
-		detailsTable.Row(reqIDShort, d.DetectorType, ruleIDShort, maskedShort)
+		detailsTable.Row(d.RequestID, d.DetectorType, ruleIDShort, maskedShort)
 	}
 	sb.WriteString(detailsTable.Render())
 	sb.WriteString("\n")
