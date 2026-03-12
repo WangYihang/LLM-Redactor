@@ -66,6 +66,11 @@ func (r *Redactor) RedactContent(content string, context map[string]string) stri
 	for _, rule := range r.config.Rules {
 		// Simple regex replacement
 		content = rule.Regex.ReplaceAllStringFunc(content, func(match string) string {
+			// Ignore zero-length matches to prevent infinite loops or per-character redaction
+			if len(match) == 0 {
+				return match
+			}
+
 			// Check global allow list
 			for _, allow := range r.config.AllowList {
 				if match == allow {
