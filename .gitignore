@@ -38,8 +38,5 @@ dist/
 # Add changelog file
 CHANGELOG.md
 
-# Log files
-*.jsonl
-
 # Test files
 test.md
