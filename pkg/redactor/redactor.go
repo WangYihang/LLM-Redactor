@@ -20,7 +20,21 @@ import (
 
 const (
 	RedactedPlaceholder = "REDACTED_SECRET"
+	eventChannelSize    = 256
 )
+
+// detectionEvent captures all info needed to log a single detection asynchronously.
+type detectionEvent struct {
+	DetectorType string
+	RuleID       string
+	Description  string
+	Match        string
+	RequestID    string
+	Source       string
+	Host         string
+	Path         string
+	Method       string
+}
 
 type DetectionDetail struct {
 	RequestID     string
@@ -36,6 +50,8 @@ type Redactor struct {
 	stats            sync.Map // detector_type -> *int64
 	details          []DetectionDetail
 	mu               sync.Mutex
+	eventCh          chan detectionEvent
+	done             chan struct{}
 	appLogPath       string
 	trafficLogPath   string
 	detectionLogPath string
@@ -113,11 +129,15 @@ func New(configPath string, sysLog, detectionLog zerolog.Logger) (*Redactor, err
 		detectors.NewEntropyDetector(4.3, 32),
 	}
 
-	return &Redactor{
+	r := &Redactor{
 		config:    &config,
 		logs:      detectionLog,
 		detectors: detectorsList,
-	}, nil
+		eventCh:   make(chan detectionEvent, eventChannelSize),
+		done:      make(chan struct{}),
+	}
+	go r.processEvents()
+	return r, nil
 }
 
 func mask(s string) string {
@@ -127,67 +147,94 @@ func mask(s string) string {
 	return s[:4] + "..." + s[len(s)-4:]
 }
 
-// RedactContent redacts a single string content and logs detections
+// processEvents runs in a background goroutine, consuming detection events
+// from the channel and performing logging, stats, and dedup off the hot path.
+func (r *Redactor) processEvents() {
+	defer close(r.done)
+	for evt := range r.eventCh {
+		// Log detection
+		logEvt := r.logs.Info().
+			Str("detector_type", evt.DetectorType).
+			Str("rule_id", evt.RuleID).
+			Str("description", evt.Description).
+			Str("masked_content", mask(evt.Match)).
+			Int("match_length", len(evt.Match))
+
+		if evt.RequestID != "" {
+			logEvt.Str("request_id", evt.RequestID)
+		}
+		if evt.Source != "" {
+			logEvt.Str("source", evt.Source)
+		}
+		if evt.Host != "" {
+			logEvt.Str("host", evt.Host)
+		}
+		if evt.Path != "" {
+			logEvt.Str("path", evt.Path)
+		}
+		if evt.Method != "" {
+			logEvt.Str("method", evt.Method)
+		}
+
+		logEvt.Msg("secret detected")
+
+		// Update stats
+		actual, _ := r.stats.LoadOrStore(evt.DetectorType, new(int64))
+		atomic.AddInt64(actual.(*int64), 1)
+
+		// Record details (de-duplicated)
+		masked := mask(evt.Match)
+		r.mu.Lock()
+		found := false
+		for _, d := range r.details {
+			if d.RequestID == evt.RequestID && d.DetectorType == evt.DetectorType && d.RuleID == evt.RuleID && d.MaskedContent == masked {
+				found = true
+				break
+			}
+		}
+		if !found {
+			r.details = append(r.details, DetectionDetail{
+				RequestID:     evt.RequestID,
+				DetectorType:  evt.DetectorType,
+				RuleID:        evt.RuleID,
+				MaskedContent: masked,
+			})
+		}
+		r.mu.Unlock()
+	}
+}
+
+// Close shuts down the background event processor and waits for all
+// pending detection events to be flushed.
+func (r *Redactor) Close() {
+	close(r.eventCh)
+	<-r.done
+}
+
+// RedactContent redacts a single string content and sends detections
+// to the background processor asynchronously.
 func (r *Redactor) RedactContent(ctx context.Context, content string) string {
 	for _, detector := range r.detectors {
 		content = detector.Redact(content, func(match, ruleID, description string) string {
-			// Check global allow list
+			// Check global allow list (must stay synchronous — affects return value)
 			for _, allow := range r.config.AllowList {
 				if match == allow {
 					return match
 				}
 			}
 
-			// LOG DETECTION
-			evt := r.logs.Info().
-				Str("detector_type", detector.Type()).
-				Str("rule_id", ruleID).
-				Str("description", description).
-				Str("masked_content", mask(match)).
-				Int("match_length", len(match))
-
-			if reqID := ctxkeys.GetString(ctx, ctxkeys.RequestID); reqID != "" {
-				evt.Str("request_id", reqID)
+			// Send detection event to background processor
+			r.eventCh <- detectionEvent{
+				DetectorType: detector.Type(),
+				RuleID:       ruleID,
+				Description:  description,
+				Match:        match,
+				RequestID:    ctxkeys.GetString(ctx, ctxkeys.RequestID),
+				Source:       ctxkeys.GetString(ctx, ctxkeys.Source),
+				Host:         ctxkeys.GetString(ctx, ctxkeys.Host),
+				Path:         ctxkeys.GetString(ctx, ctxkeys.Path),
+				Method:       ctxkeys.GetString(ctx, ctxkeys.Method),
 			}
-			if source := ctxkeys.GetString(ctx, ctxkeys.Source); source != "" {
-				evt.Str("source", source)
-			}
-			if host := ctxkeys.GetString(ctx, ctxkeys.Host); host != "" {
-				evt.Str("host", host)
-			}
-			if path := ctxkeys.GetString(ctx, ctxkeys.Path); path != "" {
-				evt.Str("path", path)
-			}
-			if method := ctxkeys.GetString(ctx, ctxkeys.Method); method != "" {
-				evt.Str("method", method)
-			}
-
-			evt.Msg("secret detected")
-
-			// Update stats
-			actual, _ := r.stats.LoadOrStore(detector.Type(), new(int64))
-			atomic.AddInt64(actual.(*int64), 1)
-
-			// Record details (de-duplicated by RequestID, DetectorType, RuleID, MaskedContent)
-			r.mu.Lock()
-			found := false
-			reqID := ctxkeys.GetString(ctx, ctxkeys.RequestID)
-			masked := mask(match)
-			for _, d := range r.details {
-				if d.RequestID == reqID && d.DetectorType == detector.Type() && d.RuleID == ruleID && d.MaskedContent == masked {
-					found = true
-					break
-				}
-			}
-			if !found {
-				r.details = append(r.details, DetectionDetail{
-					RequestID:     reqID,
-					DetectorType:  detector.Type(),
-					RuleID:        ruleID,
-					MaskedContent: masked,
-				})
-			}
-			r.mu.Unlock()
 
 			return RedactedPlaceholder
 		})

@@ -29,6 +29,7 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 	defer func() {
 		closeProxy()
 		if rdr != nil {
+			rdr.Close()
 			fmt.Println(rdr.Summary())
 		}
 	}()

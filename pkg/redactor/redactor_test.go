@@ -13,6 +13,28 @@ import (
 	"github.com/wangyihang/llm-prism/pkg/utils/ctxkeys"
 )
 
+// newTestRedactor creates a Redactor with a running background goroutine,
+// suitable for tests. Callers must defer r.Close().
+func newTestRedactor(rules []Rule, log zerolog.Logger) *Redactor {
+	var regexRules []detectors.RegexRule
+	for _, rule := range rules {
+		regexRules = append(regexRules, detectors.RegexRule{
+			ID:          rule.ID,
+			Description: rule.Description,
+			Regex:       rule.Regex,
+		})
+	}
+	r := &Redactor{
+		config:    &Config{Rules: rules},
+		logs:      log,
+		detectors: []detectors.Detector{detectors.NewRegexDetector(regexRules)},
+		eventCh:   make(chan detectionEvent, eventChannelSize),
+		done:      make(chan struct{}),
+	}
+	go r.processEvents()
+	return r
+}
+
 func TestRuleFiltering(t *testing.T) {
 	config := `
 [[rules]]
@@ -35,6 +57,7 @@ regex = "(?<=secret:)[a-z]+"
 	if err != nil {
 		t.Fatalf("Failed to create redactor: %v", err)
 	}
+	defer r.Close()
 
 	if len(r.config.Rules) != 1 {
 		t.Errorf("Expected 1 rule from config, got %d", len(r.config.Rules))
@@ -42,18 +65,10 @@ regex = "(?<=secret:)[a-z]+"
 }
 
 func TestRedactRequest(t *testing.T) {
-	r := &Redactor{
-		config: &Config{
-			Rules: []Rule{
-				{ID: "test-secret", RawRegex: "SECRET_KEY_[0-9]{5}"},
-			},
-		},
-		logs: zerolog.Nop(),
-	}
-	if err := r.config.Rules[0].Compile(); err != nil {
-		t.Fatalf("Failed to compile rule: %v", err)
-	}
-	r.detectors = []detectors.Detector{detectors.NewRegexDetector([]detectors.RegexRule{{ID: r.config.Rules[0].ID, Description: r.config.Rules[0].Description, Regex: r.config.Rules[0].Regex}})}
+	rules := []Rule{{ID: "test-secret", RawRegex: "SECRET_KEY_[0-9]{5}"}}
+	_ = rules[0].Compile()
+	r := newTestRedactor(rules, zerolog.Nop())
+	defer r.Close()
 
 	reqBody := `{"messages": [{"role": "user", "content": "The key is SECRET_KEY_12345"}]}`
 	redacted, _ := r.RedactRequest(context.Background(), []byte(reqBody))
@@ -65,21 +80,15 @@ func TestRedactRequest(t *testing.T) {
 
 func TestDetectionLogging(t *testing.T) {
 	var buf bytes.Buffer
-	r := &Redactor{
-		config: &Config{
-			Rules: []Rule{
-				{ID: "log-rule", Description: "Test Desc", RawRegex: "HIT_ME"},
-			},
-		},
-		logs: zerolog.New(&buf),
-	}
-	if err := r.config.Rules[0].Compile(); err != nil {
-		t.Fatalf("Failed to compile rule: %v", err)
-	}
-	r.detectors = []detectors.Detector{detectors.NewRegexDetector([]detectors.RegexRule{{ID: r.config.Rules[0].ID, Description: r.config.Rules[0].Description, Regex: r.config.Rules[0].Regex}})}
+	rules := []Rule{{ID: "log-rule", Description: "Test Desc", RawRegex: "HIT_ME"}}
+	_ = rules[0].Compile()
+	r := newTestRedactor(rules, zerolog.New(&buf))
 
 	ctx := context.WithValue(context.Background(), ctxkeys.RequestID, "test-req-id")
 	r.RedactContent(ctx, "Text HIT_ME text")
+
+	// Close to flush async events before checking the buffer
+	r.Close()
 
 	output := buf.String()
 	if !strings.Contains(output, "log-rule") || !strings.Contains(output, "test-req-id") {
@@ -88,16 +97,10 @@ func TestDetectionLogging(t *testing.T) {
 }
 
 func TestRedactValueRecursively(t *testing.T) {
-	r := &Redactor{
-		config: &Config{
-			Rules: []Rule{
-				{ID: "edge-secret", RawRegex: "MY_PASSWORD"},
-			},
-		},
-		logs: zerolog.Nop(),
-	}
-	_ = r.config.Rules[0].Compile()
-	r.detectors = []detectors.Detector{detectors.NewRegexDetector([]detectors.RegexRule{{ID: r.config.Rules[0].ID, Description: r.config.Rules[0].Description, Regex: r.config.Rules[0].Regex}})}
+	rules := []Rule{{ID: "edge-secret", RawRegex: "MY_PASSWORD"}}
+	_ = rules[0].Compile()
+	r := newTestRedactor(rules, zerolog.Nop())
+	defer r.Close()
 
 	val := r.RedactValue(context.Background(), []interface{}{"A_MY_PASSWORD_B", map[string]interface{}{"key": "MY_PASSWORD"}})
 	valJSON, _ := json.Marshal(val)
@@ -115,6 +118,7 @@ func TestConfigLoadFallback(t *testing.T) {
 	if err != nil || len(r2.config.Rules) != 1 {
 		t.Errorf("Failed to load JSON config (expected 1 config): %v, got count %d", err, len(r2.config.Rules))
 	}
+	defer r2.Close()
 }
 
 func TestRedactorMask(t *testing.T) {

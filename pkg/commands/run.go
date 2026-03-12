@@ -29,6 +29,7 @@ func Run(cli *config.CLI, logs *logging.Loggers) {
 	<-sigChan
 
 	if rdr != nil {
+		rdr.Close()
 		fmt.Println(rdr.Summary())
 	}
 }
