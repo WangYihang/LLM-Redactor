@@ -12,11 +12,12 @@ func init() {
 }
 
 type Loggers struct {
-	System zerolog.Logger
-	Data   zerolog.Logger
+	System    zerolog.Logger
+	Data      zerolog.Logger
+	Detection zerolog.Logger
 }
 
-func New(logFile string) *Loggers {
+func New(logFile string, detectionLogFile string) *Loggers {
 	consoleWriter := zerolog.ConsoleWriter{
 		Out:        os.Stderr,
 		TimeFormat: "15:04:05",
@@ -24,22 +25,29 @@ func New(logFile string) *Loggers {
 	sysLog := zerolog.New(consoleWriter).
 		With().
 		Timestamp().
-		Caller().
 		Logger()
 
-	fileWriter, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-
-		sysLog.Fatal().Err(err).Str("path", logFile).Msg("cannot open data log file")
+	openFile := func(path string) *os.File {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			sysLog.Fatal().Err(err).Str("path", path).Msg("cannot open log file")
+		}
+		return f
 	}
 
-	dataLog := zerolog.New(fileWriter).
+	dataLog := zerolog.New(openFile(logFile)).
+		With().
+		Timestamp().
+		Logger()
+
+	detectionLog := zerolog.New(openFile(detectionLogFile)).
 		With().
 		Timestamp().
 		Logger()
 
 	return &Loggers{
-		System: sysLog,
-		Data:   dataLog,
+		System:    sysLog,
+		Data:      dataLog,
+		Detection: detectionLog,
 	}
 }
