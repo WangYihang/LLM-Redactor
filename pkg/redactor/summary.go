@@ -48,9 +48,17 @@ func (r *Redactor) Summary() string {
 	sb.WriteString(fmt.Sprintf("%s %s\n", keyStyle.Render("  • Rules Loaded:  "), valStyle.Render(fmt.Sprintf("%d", len(r.config.Rules)))))
 	sb.WriteString(fmt.Sprintf("%s %s\n", keyStyle.Render("  • Detectors:     "), valStyle.Render(fmt.Sprintf("%d", len(r.detectors)))))
 
-	listItemStyle := lipgloss.NewStyle().PaddingLeft(4).Foreground(lipgloss.Color("#04B575"))
+	listItemStyle := lipgloss.NewStyle().PaddingLeft(6).Foreground(lipgloss.Color("#04B575"))
 	for _, d := range r.detectors {
-		sb.WriteString(listItemStyle.Render(fmt.Sprintf("- %s\n", d.Type())))
+		sb.WriteString(listItemStyle.Render(fmt.Sprintf("- %s", d.Type())))
+		sb.WriteString("\n")
+	}
+
+	tableStyleFunc := func(row, col int) lipgloss.Style {
+		if row == 0 {
+			return lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Bold(true).Padding(0, 1)
+		}
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Padding(0, 1)
 	}
 
 	if len(stats) == 0 {
@@ -67,8 +75,9 @@ func (r *Redactor) Summary() string {
 	sb.WriteString("\n")
 
 	statsTable := table.New().
-		Border(lipgloss.NormalBorder()).
-		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#999999"))).
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4"))).
+		StyleFunc(tableStyleFunc).
 		Headers("Detector Type", "Total Matches")
 
 	var total int64
@@ -109,8 +118,9 @@ func (r *Redactor) Summary() string {
 		sb.WriteString("\n")
 
 		rulesTable := table.New().
-			Border(lipgloss.NormalBorder()).
-			BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#999999"))).
+			Border(lipgloss.RoundedBorder()).
+			BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4"))).
+			StyleFunc(tableStyleFunc).
 			Headers("Rule ID", "Hits")
 
 		for ruleID, count := range ruleHitCount {
@@ -129,8 +139,9 @@ func (r *Redactor) Summary() string {
 	sb.WriteString("\n")
 
 	detailsTable := table.New().
-		Border(lipgloss.NormalBorder()).
-		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#999999"))).
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4"))).
+		StyleFunc(tableStyleFunc).
 		Headers("Request ID", "Detector", "Rule ID", "Masked Value")
 
 	for _, d := range details {
