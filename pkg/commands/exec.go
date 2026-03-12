@@ -19,6 +19,34 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 		os.Exit(1)
 	}
 
+	// Auto-detect provider and URL if using defaults
+	cmdName := strings.ToLower(cli.Exec.Command[0])
+	isDefaultURL := cli.Exec.ApiURL == "https://api.deepseek.com/anthropic"
+	isDefaultProvider := cli.Exec.Provider == "deepseek"
+
+	if isDefaultProvider {
+		switch {
+		case strings.Contains(cmdName, "claude"):
+			// If URL is also default, keep as deepseek (common user pattern)
+			// But if user provided a different URL (like anthropic.com), switch to claude provider
+			if !isDefaultURL && (strings.Contains(cli.Exec.ApiURL, "anthropic.com") || strings.Contains(cli.Exec.ApiURL, "localhost")) {
+				cli.Exec.Provider = "claude"
+			}
+		case strings.Contains(cmdName, "gemini"):
+			cli.Exec.Provider = "gemini"
+			if isDefaultURL {
+				cli.Exec.ApiURL = "https://generativelanguage.googleapis.com"
+				logs.System.Info().Msg("Automatically switched to Gemini API URL")
+			}
+		case strings.Contains(cmdName, "aider"), strings.Contains(cmdName, "codex"), strings.Contains(cmdName, "openai"):
+			cli.Exec.Provider = "openai"
+			if isDefaultURL {
+				cli.Exec.ApiURL = "https://api.openai.com"
+				logs.System.Info().Msg("Automatically switched to OpenAI API URL")
+			}
+		}
+	}
+
 	// Start the proxy
 	rdr, addr, closeProxy, err := StartProxy(cli, logs, cli.Exec.Host, cli.Exec.Port, cli.Exec.ApiURL, cli.Exec.ApiKey, cli.Exec.Provider)
 	if err != nil {
@@ -49,8 +77,8 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 		"ANTHROPIC_BASE_URL": proxyURL,
 
 		// OpenAI (Codex and others)
-		"OPENAI_BASE_URL":    proxyURL + "/v1",
-		"OPENAI_API_BASE":    proxyURL + "/v1",
+		"OPENAI_BASE_URL":     proxyURL + "/v1",
+		"OPENAI_API_BASE":     proxyURL + "/v1",
 		"OPENAI_API_BASE_URL": proxyURL + "/v1",
 		"CODEX_API_BASE":      proxyURL + "/v1",
 
@@ -69,9 +97,9 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 	}
 
 	// Prepare the command
-	cmdName := cli.Exec.Command[0]
+	cmdName = cli.Exec.Command[0]
 	cmdArgs := cli.Exec.Command[1:]
-	
+
 	path, err := exec.LookPath(cmdName)
 	if err != nil {
 		fmt.Printf("Error: command not found: %s\n", cmdName)
