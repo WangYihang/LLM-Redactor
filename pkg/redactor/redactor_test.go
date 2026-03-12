@@ -2,12 +2,14 @@ package redactor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
+	"github.com/wangyihang/llm-prism/pkg/utils/ctxkeys"
 )
 
 func TestRuleFiltering(t *testing.T) {
@@ -53,7 +55,7 @@ func TestRedactRequest(t *testing.T) {
 	r.detectors = []Detector{NewRegexDetector(r.config.Rules)}
 
 	reqBody := `{"messages": [{"role": "user", "content": "The key is SECRET_KEY_12345"}]}`
-	redacted, _ := r.RedactRequest([]byte(reqBody), nil)
+	redacted, _ := r.RedactRequest(context.Background(), []byte(reqBody))
 
 	if strings.Contains(string(redacted), "SECRET_KEY_12345") {
 		t.Error("Secret not redacted in request")
@@ -75,7 +77,7 @@ func TestStreamRedactorSlidingWindow(t *testing.T) {
 	r.detectors = []Detector{NewRegexDetector(r.config.Rules)}
 
 	// 使用较大窗口以容纳完整占位符
-	sr := NewStreamRedactor(r, 30, nil)
+	sr := NewStreamRedactor(context.Background(), r, 30)
 
 	// 模拟敏感词被切分： "DAN" + "GER_ZONE"
 	line1 := `data: {"choices":[{"delta":{"content":"DAN"}}]} `
@@ -110,10 +112,11 @@ func TestDetectionLogging(t *testing.T) {
 	}
 	r.detectors = []Detector{NewRegexDetector(r.config.Rules)}
 
-	r.RedactContent("Text HIT_ME text", map[string]string{"ctx_key": "ctx_val"})
+	ctx := context.WithValue(context.Background(), ctxkeys.RequestID, "test-req-id")
+	r.RedactContent(ctx, "Text HIT_ME text")
 
 	output := buf.String()
-	if !strings.Contains(output, "log-rule") || !strings.Contains(output, "ctx_val") {
+	if !strings.Contains(output, "log-rule") || !strings.Contains(output, "test-req-id") {
 		t.Errorf("Audit log incomplete: %s", output)
 	}
 }
@@ -130,7 +133,7 @@ func TestStreamRedactorEdgeCases(t *testing.T) {
 	_ = r.config.Rules[0].Compile()
 	r.detectors = []Detector{NewRegexDetector(r.config.Rules)}
 
-	sr := NewStreamRedactor(r, 10, nil)
+	sr := NewStreamRedactor(context.Background(), r, 10)
 
 	// Test non-data line
 	nonData := []byte("invalid line\n")
@@ -152,7 +155,7 @@ func TestStreamRedactorEdgeCases(t *testing.T) {
 	}
 
 	// Test empty content
-	sr = NewStreamRedactor(r, 10, nil)
+	sr = NewStreamRedactor(context.Background(), r, 10)
 	sr.RedactSSELine([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"MY_\"}}]}\n"))
 	emptyContentLine := []byte("data: {\"choices\":[{\"delta\":{}}]}\n")
 	outEmpty := sr.RedactSSELine(emptyContentLine)
@@ -167,7 +170,7 @@ func TestStreamRedactorEdgeCases(t *testing.T) {
 	}
 
 	// Test RedactValue recursively
-	val := sr.r.RedactValue([]interface{}{"A_MY_PASSWORD_B", map[string]interface{}{"key": "MY_PASSWORD"}}, nil)
+	val := sr.r.RedactValue(context.Background(), []interface{}{"A_MY_PASSWORD_B", map[string]interface{}{"key": "MY_PASSWORD"}})
 	valJSON, _ := json.Marshal(val)
 	if strings.Contains(string(valJSON), "MY_PASSWORD") {
 		t.Errorf("RedactValue failed to redact recursively: %s", string(valJSON))

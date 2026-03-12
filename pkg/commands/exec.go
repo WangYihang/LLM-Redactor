@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,36 +21,8 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 		os.Exit(1)
 	}
 
-	// Auto-detect provider and URL if using defaults
-	cmdName := strings.ToLower(cli.Exec.Command[0])
-	isDefaultURL := cli.Exec.ApiURL == "https://api.deepseek.com/anthropic"
-	isDefaultProvider := cli.Exec.Provider == "deepseek"
-
-	if isDefaultProvider {
-		switch {
-		case strings.Contains(cmdName, "claude"):
-			// If URL is also default, keep as deepseek (common user pattern)
-			// But if user provided a different URL (like anthropic.com), switch to claude provider
-			if !isDefaultURL && (strings.Contains(cli.Exec.ApiURL, "anthropic.com") || strings.Contains(cli.Exec.ApiURL, "localhost")) {
-				cli.Exec.Provider = "claude"
-			}
-		case strings.Contains(cmdName, "gemini"):
-			cli.Exec.Provider = "gemini"
-			if isDefaultURL {
-				cli.Exec.ApiURL = "https://generativelanguage.googleapis.com"
-				logs.System.Info().Msg("Automatically switched to Gemini API URL")
-			}
-		case strings.Contains(cmdName, "aider"), strings.Contains(cmdName, "codex"), strings.Contains(cmdName, "openai"):
-			cli.Exec.Provider = "openai"
-			if isDefaultURL {
-				cli.Exec.ApiURL = "https://api.openai.com"
-				logs.System.Info().Msg("Automatically switched to OpenAI API URL")
-			}
-		}
-	}
-
 	// Start the proxy
-	rdr, addr, closeProxy, err := StartProxy(cli, logs, cli.Exec.Host, cli.Exec.Port, cli.Exec.ApiURL, cli.Exec.ApiKey, cli.Exec.Provider)
+	rdr, addr, closeProxy, err := StartProxy(cli, logs, cli.Exec.Host, cli.Exec.Port)
 	if err != nil {
 		logs.System.Fatal().Err(err).Msg("failed to start proxy")
 	}
@@ -77,24 +50,22 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 
 	// Prepare environment variables
 	env := os.Environ()
+	sessionDir := filepath.Dir(cli.AppLogFile)
+	caPath := filepath.Join(sessionDir, "ca.crt")
 	proxyEnvs := map[string]string{
-		// Anthropic (Claude)
-		"ANTHROPIC_BASE_URL": proxyURL,
+		// Node.js specific CA certs
+		"NODE_EXTRA_CA_CERTS": caPath,
 
-		// OpenAI (Codex and others)
-		"OPENAI_BASE_URL":     proxyURL + "/v1",
-		"OPENAI_API_BASE":     proxyURL + "/v1",
-		"OPENAI_API_BASE_URL": proxyURL + "/v1",
-		"CODEX_API_BASE":      proxyURL + "/v1",
+		// OpenSSL, Curl, and Python requests CA certs
+		"SSL_CERT_FILE":      caPath,
+		"CURL_CA_BUNDLE":     caPath,
+		"REQUESTS_CA_BUNDLE": caPath,
 
-		// Google (Gemini)
-		"GOOGLE_GEMINI_BASE_URL": proxyURL,
-		"GEMINI_API_BASE_URL":    proxyURL,
-		"GEMINI_BASE_URL":        proxyURL,
-		"GOOGLE_API_BASE":        proxyURL,
-
-		// DeepSeek
-		"DEEPSEEK_BASE_URL": proxyURL,
+		// Standard proxy environment variables
+		"HTTP_PROXY":  proxyURL,
+		"HTTPS_PROXY": proxyURL,
+		"http_proxy":  proxyURL,
+		"https_proxy": proxyURL,
 	}
 
 	for k, v := range proxyEnvs {
@@ -102,7 +73,7 @@ func Exec(cli *config.CLI, logs *logging.Loggers) {
 	}
 
 	// Prepare the command
-	cmdName = cli.Exec.Command[0]
+	cmdName := cli.Exec.Command[0]
 	cmdArgs := cli.Exec.Command[1:]
 
 	path, err := exec.LookPath(cmdName)

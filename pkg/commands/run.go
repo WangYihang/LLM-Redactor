@@ -1,19 +1,16 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/rs/zerolog"
 	"github.com/wangyihang/llm-prism/pkg/config"
 	"github.com/wangyihang/llm-prism/pkg/proxy"
 	"github.com/wangyihang/llm-prism/pkg/redactor"
@@ -21,10 +18,7 @@ import (
 )
 
 func Run(cli *config.CLI, logs *logging.Loggers) {
-	if cli.Run.ApiKey == "" {
-		logs.System.Fatal().Msg("API Key is required for the 'run' command. Use --api-key or LLM_PRISM_API_KEY environment variable.")
-	}
-	rdr, _, _, err := StartProxy(cli, logs, cli.Run.Host, cli.Run.Port, cli.Run.ApiURL, cli.Run.ApiKey, cli.Run.Provider)
+	rdr, _, _, err := StartProxy(cli, logs, cli.Run.Host, cli.Run.Port)
 	if err != nil {
 		logs.System.Fatal().Err(err).Msg("failed to start proxy")
 	}
@@ -39,59 +33,33 @@ func Run(cli *config.CLI, logs *logging.Loggers) {
 	}
 }
 
-func StartProxy(cli *config.CLI, logs *logging.Loggers, host string, port int, apiURL, apiKey, provider string) (*redactor.Redactor, string, context.CancelFunc, error) {
+func StartProxy(cli *config.CLI, logs *logging.Loggers, host string, port int) (*redactor.Redactor, string, context.CancelFunc, error) {
 	rdr, err := redactor.New(cli.RedactorRules, logs.Detection)
 	if err != nil {
 		logs.System.Warn().Err(err).Msg("failed to load redactor rules, skipping redaction")
+		rdr = nil
 	} else {
 		rdr.SetLogPaths(cli.AppLogFile, cli.TrafficLogFile, cli.DetectionLogFile)
 	}
 
-	// Setup local variable overrides
-	tempCLI := *cli
-	tempCLI.Run.ApiURL = apiURL
-	tempCLI.Run.ApiKey = apiKey
-	tempCLI.Run.Provider = provider
-
-	rp, err := proxy.Setup(&tempCLI, rdr, logs)
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("failed to setup reverse proxy: %w", err)
+	var contentRedactor proxy.ContentRedactor
+	if rdr != nil {
+		contentRedactor = rdr
 	}
+
+	sessionDir := filepath.Dir(cli.AppLogFile)
+	p := proxy.New(contentRedactor, logs.System, logs.Traffic, sessionDir)
 
 	addr := fmt.Sprintf("%s:%d", host, port)
-	server := &http.Server{
-		Addr: addr,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			t := time.Now()
-			requestID := uuid.New().String()
-			rb := new(bytes.Buffer)
-			if r.Body != nil {
-				r.Body = io.NopCloser(io.TeeReader(r.Body, rb))
-			}
-			sw := &proxy.Spy{ResponseWriter: w, Buf: new(bytes.Buffer), Code: http.StatusOK}
-
-			r = r.WithContext(proxy.WithRequestID(r.Context(), requestID))
-			rp.ServeHTTP(sw, r)
-
-			reqEvt := zerolog.Dict().Str("id", requestID).Str("method", r.Method).Str("path", r.URL.Path)
-			proxy.EnrichLogEvent(reqEvt, rb.Bytes(), r.Header, logs.System)
-
-			resEvt := zerolog.Dict().Int("status", sw.Code)
-			proxy.EnrichLogEvent(resEvt, sw.Buf.Bytes(), sw.Header(), logs.System)
-
-			logs.Traffic.Info().
-				Str("id", requestID).
-				Dur("duration", time.Since(t)).
-				Dict("http", zerolog.Dict().Dict("request", reqEvt).Dict("response", resEvt)).
-				Msg("")
-		}),
-	}
-
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, "", nil, err
 	}
 	actualAddr := ln.Addr().String()
+
+	server := &http.Server{
+		Handler: p,
+	}
 
 	go func() {
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {

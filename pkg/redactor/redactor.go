@@ -2,6 +2,7 @@ package redactor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/rs/zerolog"
 	"github.com/wangyihang/llm-prism/pkg/utils"
+	"github.com/wangyihang/llm-prism/pkg/utils/ctxkeys"
 )
 
 const (
@@ -147,7 +149,7 @@ func mask(s string) string {
 }
 
 // RedactContent redacts a single string content and logs detections
-func (r *Redactor) RedactContent(content string, context map[string]string) string {
+func (r *Redactor) RedactContent(ctx context.Context, content string) string {
 	for _, detector := range r.detectors {
 		content = detector.Redact(content, func(match, ruleID, description string) string {
 			// Check global allow list
@@ -165,9 +167,22 @@ func (r *Redactor) RedactContent(content string, context map[string]string) stri
 				Str("masked_content", mask(match)).
 				Int("match_length", len(match))
 
-			for k, v := range context {
-				evt.Str(k, v)
+			if reqID := ctxkeys.GetString(ctx, ctxkeys.RequestID); reqID != "" {
+				evt.Str("request_id", reqID)
 			}
+			if source := ctxkeys.GetString(ctx, ctxkeys.Source); source != "" {
+				evt.Str("source", source)
+			}
+			if host := ctxkeys.GetString(ctx, ctxkeys.Host); host != "" {
+				evt.Str("host", host)
+			}
+			if path := ctxkeys.GetString(ctx, ctxkeys.Path); path != "" {
+				evt.Str("path", path)
+			}
+			if method := ctxkeys.GetString(ctx, ctxkeys.Method); method != "" {
+				evt.Str("method", method)
+			}
+
 			evt.Msg("secret detected")
 
 			// Update stats
@@ -177,7 +192,7 @@ func (r *Redactor) RedactContent(content string, context map[string]string) stri
 			// Record details (de-duplicated by RequestID, DetectorType, RuleID, MaskedContent)
 			r.mu.Lock()
 			found := false
-			reqID := context["request_id"]
+			reqID := ctxkeys.GetString(ctx, ctxkeys.RequestID)
 			masked := mask(match)
 			for _, d := range r.details {
 				if d.RequestID == reqID && d.DetectorType == detector.Type() && d.RuleID == ruleID && d.MaskedContent == masked {
@@ -258,18 +273,18 @@ func (r *Redactor) Summary() string {
 }
 
 // RedactValue recursively traverses a JSON-compatible structure and redacts all string values
-func (r *Redactor) RedactValue(v interface{}, context map[string]string) interface{} {
+func (r *Redactor) RedactValue(ctx context.Context, v interface{}) interface{} {
 	switch val := v.(type) {
 	case string:
-		return r.RedactContent(val, context)
+		return r.RedactContent(ctx, val)
 	case map[string]interface{}:
 		for k, v := range val {
-			val[k] = r.RedactValue(v, context)
+			val[k] = r.RedactValue(ctx, v)
 		}
 		return val
 	case []interface{}:
 		for i, v := range val {
-			val[i] = r.RedactValue(v, context)
+			val[i] = r.RedactValue(ctx, v)
 		}
 		return val
 	default:
@@ -278,7 +293,7 @@ func (r *Redactor) RedactValue(v interface{}, context map[string]string) interfa
 }
 
 // RedactRequest redacts all string values in a JSON request body
-func (r *Redactor) RedactRequest(body []byte, context map[string]string) ([]byte, error) {
+func (r *Redactor) RedactRequest(ctx context.Context, body []byte) ([]byte, error) {
 	if !json.Valid(body) {
 		return body, nil
 	}
@@ -288,7 +303,7 @@ func (r *Redactor) RedactRequest(body []byte, context map[string]string) ([]byte
 		return body, err
 	}
 
-	redactedData := r.RedactValue(data, context)
+	redactedData := r.RedactValue(ctx, data)
 	return json.Marshal(redactedData)
 }
 
@@ -296,19 +311,19 @@ func (r *Redactor) RedactRequest(body []byte, context map[string]string) ([]byte
 type StreamRedactor struct {
 	r             *Redactor
 	maxLen        int
-	context       map[string]string
+	ctx           context.Context
 	buffer        string
 	templateEvent map[string]interface{}
 }
 
-func NewStreamRedactor(r *Redactor, windowSize int, context map[string]string) *StreamRedactor {
+func NewStreamRedactor(ctx context.Context, r *Redactor, windowSize int) *StreamRedactor {
 	if windowSize <= 0 {
 		windowSize = 100
 	}
 	return &StreamRedactor{
-		r:       r,
-		maxLen:  windowSize,
-		context: context,
+		r:      r,
+		maxLen: windowSize,
+		ctx:    ctx,
 	}
 }
 
@@ -370,7 +385,7 @@ func (sr *StreamRedactor) emitTemplate(text string) []byte {
 		return nil
 	}
 	sr.setContent(sr.templateEvent, text)
-	sr.r.RedactValue(sr.templateEvent, sr.context)
+	sr.r.RedactValue(sr.ctx, sr.templateEvent)
 	newRaw, _ := json.Marshal(sr.templateEvent)
 	return append([]byte("data: "), newRaw...)
 }
@@ -405,7 +420,7 @@ func (sr *StreamRedactor) RedactSSELine(line []byte) []byte {
 
 	if content == "" {
 		flushed := sr.Flush()
-		sr.r.RedactValue(data, sr.context)
+		sr.r.RedactValue(sr.ctx, data)
 		newRaw, _ := json.Marshal(data)
 		out := append([]byte("data: "), newRaw...)
 		if hasNewline {
@@ -425,7 +440,7 @@ func (sr *StreamRedactor) RedactSSELine(line []byte) []byte {
 		sr.templateEvent = data
 	}
 
-	redacted := sr.r.RedactContent(sr.buffer, sr.context)
+	redacted := sr.r.RedactContent(sr.ctx, sr.buffer)
 	if redacted != sr.buffer {
 		out := sr.emitTemplate(redacted)
 		sr.buffer = ""
@@ -456,7 +471,7 @@ func (sr *StreamRedactor) Flush() []byte {
 	if sr.buffer == "" {
 		return nil
 	}
-	redacted := sr.r.RedactContent(sr.buffer, sr.context)
+	redacted := sr.r.RedactContent(sr.ctx, sr.buffer)
 	out := sr.emitTemplate(redacted)
 	sr.buffer = ""
 	sr.templateEvent = nil
