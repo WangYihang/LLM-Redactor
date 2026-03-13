@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
@@ -17,8 +16,13 @@ import (
 )
 
 func main() {
-	var cli config.CLI
-	ctx := kong.Parse(&cli, kong.Name("llm-redactor"), kong.UsageOnError())
+	var cli config.ProxyCLI
+	kong.Parse(&cli, kong.Name("llm-proxy"), kong.UsageOnError())
+
+	if cli.Version {
+		fmt.Println(version.GetVersionInfo().JSON())
+		return
+	}
 
 	// Session Setup
 	sessionID := fmt.Sprintf("%s-%s", time.Now().Format("20060102-150405"), uuid.New().String()[:8])
@@ -41,12 +45,5 @@ func main() {
 	cli.TrafficLogFile = trafficLogPath
 	cli.DetectionLogFile = detectionLogPath
 
-	switch strings.Split(ctx.Command(), " ")[0] {
-	case "version":
-		fmt.Println(version.GetVersionInfo().JSON())
-	case "run":
-		commands.Run(&cli, logs)
-	case "exec":
-		commands.Exec(&cli, logs)
-	}
+	commands.Run(&cli, logs)
 }
