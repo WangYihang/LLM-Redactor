@@ -16,12 +16,18 @@ import (
 )
 
 func main() {
-	var cli config.ProxyCLI
-	kong.Parse(&cli, kong.Name("llm-proxy"), kong.UsageOnError())
+	var cli config.ExecCLI
+	kong.Parse(&cli, kong.Name("llm-redactor-exec"), kong.UsageOnError())
 
 	if cli.Version {
 		fmt.Println(version.GetVersionInfo().JSON())
 		return
+	}
+
+	if len(cli.Command) == 0 {
+		fmt.Println("Error: command is required")
+		fmt.Println("Usage: llm-redactor-exec [options] -- <command> [args...]")
+		os.Exit(1)
 	}
 
 	// Session Setup
@@ -45,5 +51,5 @@ func main() {
 	cli.TrafficLogFile = trafficLogPath
 	cli.DetectionLogFile = detectionLogPath
 
-	commands.Run(&cli, logs)
+	commands.Exec(&cli, logs)
 }
