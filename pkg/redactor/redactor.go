@@ -127,12 +127,22 @@ func New(configPath string, sysLog, detectionLog zerolog.Logger) (*Redactor, err
 		})
 	}
 
+	gitleaksDetector, err := detectors.NewGitleaksDetector()
+	if err != nil {
+		sysLog.Warn().Err(err).Msg("failed to initialise gitleaks native detector; skipping")
+	}
+
 	detectorsList := []detectors.Detector{
 		detectors.NewRegexDetector(regexRules),
 		detectors.NewDeepSeekDetector(),
 		detectors.NewIPDetector(),
+		detectors.NewEmailDetector(),
+		detectors.NewGitProjectDetector(),
 		// Default threshold 4.3 to skip hex-only strings (max entropy 4.0)
 		// detectors.NewEntropyDetector(4.3, 32),
+	}
+	if gitleaksDetector != nil {
+		detectorsList = append(detectorsList, gitleaksDetector)
 	}
 
 	r := &Redactor{
