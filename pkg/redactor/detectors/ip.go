@@ -3,9 +3,14 @@ package detectors
 import (
 	"context"
 	"fmt"
+	"net"
 	"regexp"
 	"sync"
 )
+
+// ipv4AddrCore matches a dotted IPv4 address (no CIDR). Used by IPv4 and
+// IPv4-embedded-in-IPv6 patterns so they stay in sync.
+const ipv4AddrCore = `(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)`
 
 // IPPseudonymizer maintains a bidirectional mapping between real and fake IPs.
 // Fake IPs are drawn from RFC 5737 TEST-NET ranges (192.0.2.0/24,
@@ -45,8 +50,9 @@ func (p *IPPseudonymizer) nextFakeIPv4() string {
 
 func (p *IPPseudonymizer) nextFakeIPv6() string {
 	p.ipv6Count++
-	// RFC 3849 documentation range: 2001:db8::/32
-	return fmt.Sprintf("2001:db8::%x", p.ipv6Count)
+	// RFC 3849 documentation range (2001:db8::/32), fully expanded so fakes never
+	// contain a "::…" substring that the IPv6 regex would match inside Unredact.
+	return fmt.Sprintf("2001:db8:0:0:0:0:0:%x", p.ipv6Count+1)
 }
 
 // GetOrCreate returns the fake IP for a given real IP, creating one if needed.
@@ -73,13 +79,9 @@ func (p *IPPseudonymizer) GetOrCreate(realToken string, isIPv6 bool) string {
 		fakeBase = p.nextFakeIPv4()
 	}
 
-	// Preserve CIDR prefix if present
 	cidr := ""
-	ipPart := realToken
 	if idx := cidrSuffixIndex(realToken); idx != -1 {
 		cidr = realToken[idx:]
-		ipPart = realToken[:idx]
-		_ = ipPart
 	}
 	fake := fakeBase + cidr
 
@@ -106,35 +108,70 @@ func cidrSuffixIndex(s string) int {
 	return -1
 }
 
-type IPDetector struct {
-	ipv4          *regexp.Regexp
-	ipv6          *regexp.Regexp
-	pseudonymizer *IPPseudonymizer
+// isRFC3849DocumentationIPv6 reports whether addr is in 2001:db8::/32 (RFC 3849).
+func isRFC3849DocumentationIPv6(match string) bool {
+	addr := match
+	if i := cidrSuffixIndex(match); i >= 0 {
+		addr = match[:i]
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil || ip.To4() != nil {
+		return false
+	}
+	ip = ip.To16()
+	return len(ip) == net.IPv6len && ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8
 }
 
-func NewIPDetector() *IPDetector {
+type IPDetector struct {
+	ipv4                   *regexp.Regexp
+	ipv6                   *regexp.Regexp
+	pseudonymizer          *IPPseudonymizer
+	excludePrivateLoopback bool
+}
+
+// NewIPDetector builds an IP pseudonymizer. When excludePrivateLoopback is true,
+// addresses for which net.IP reports IsPrivate or IsLoopback are not replaced
+// (useful for Docker Compose and other local routing).
+func NewIPDetector(excludePrivateLoopback bool) *IPDetector {
+	ipv4 := regexp.MustCompile(
+		`\b` + ipv4AddrCore + `(?:/(?:3[0-2]|[12]?\d))?\b`,
+	)
+	// IPv6 full/compressed (RFC 4291), plus IPv4-mapped (::ffff:x.x.x.x) and
+	// IPv4-compatible tails (::x.x.x.x). Does not match a bare "::".
+	ipv6 := regexp.MustCompile(`(?i)(?:` +
+		`(?:::ffff:)` + ipv4AddrCore +
+		`|::` + ipv4AddrCore +
+		`|[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){7}` +
+		`|(?:[0-9a-f]{1,4}:){1,7}:` +
+		`|::(?:[0-9a-f]{1,4}:){0,6}[0-9a-f]{1,4}` +
+		`|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}` +
+		`|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}` +
+		`|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}` +
+		`|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}` +
+		`|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}` +
+		`|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}` +
+		`)`,
+	)
 	return &IPDetector{
-		// Matches IPv4 addresses with optional CIDR suffix (/0–/32).
-		ipv4: regexp.MustCompile(
-			`\b(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)\.){3}` +
-				`(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]\d|\d)` +
-				`(?:/(?:3[0-2]|[12]?\d))?\b`,
-		),
-		// Matches IPv6 in full and compressed forms (RFC 4291).
-		ipv6: regexp.MustCompile(`(?i)(?:` +
-			`[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){7}` + // full 8 groups
-			`|(?:[0-9a-f]{1,4}:){1,7}:` + // trailing ::
-			`|::(?:[0-9a-f]{1,4}:){0,6}[0-9a-f]{1,4}` + // leading ::
-			`|(?:[0-9a-f]{1,4}:){1,6}:[0-9a-f]{1,4}` + // one compressed group
-			`|(?:[0-9a-f]{1,4}:){1,5}(?::[0-9a-f]{1,4}){1,2}` +
-			`|(?:[0-9a-f]{1,4}:){1,4}(?::[0-9a-f]{1,4}){1,3}` +
-			`|(?:[0-9a-f]{1,4}:){1,3}(?::[0-9a-f]{1,4}){1,4}` +
-			`|(?:[0-9a-f]{1,4}:){1,2}(?::[0-9a-f]{1,4}){1,5}` +
-			`|[0-9a-f]{1,4}:(?::[0-9a-f]{1,4}){1,6}` +
-			`|::` + // loopback / unspecified
-			`)`),
-		pseudonymizer: NewIPPseudonymizer(),
+		ipv4:                   ipv4,
+		ipv6:                   ipv6,
+		pseudonymizer:          NewIPPseudonymizer(),
+		excludePrivateLoopback: excludePrivateLoopback,
 	}
+}
+
+// ipMatchIsPrivateOrLoopback reports whether match is an IP (optional CIDR) that
+// should be left unchanged when excludePrivateLoopback is enabled.
+func ipMatchIsPrivateOrLoopback(match string) bool {
+	addr := match
+	if i := cidrSuffixIndex(match); i >= 0 {
+		addr = match[:i]
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback()
 }
 
 func (d *IPDetector) Type() string { return "ip" }
@@ -142,14 +179,24 @@ func (d *IPDetector) Type() string { return "ip" }
 // Redact replaces each detected IP with a stable fake IP from the TEST-NET
 // ranges and invokes callback for logging/stats (passing the real IP).
 func (d *IPDetector) Redact(ctx context.Context, content string, callback RedactionCallback) string {
-	content = d.ipv4.ReplaceAllStringFunc(content, func(match string) string {
-		fake := d.pseudonymizer.GetOrCreate(match, false)
-		callback(match, "ipv4-address", "IPv4 Address")
-		return fake
-	})
+	// IPv6 first so IPv4 substrings inside IPv4-mapped addresses are not torn apart.
 	content = d.ipv6.ReplaceAllStringFunc(content, func(match string) string {
+		if isRFC3849DocumentationIPv6(match) {
+			return match
+		}
+		if d.excludePrivateLoopback && ipMatchIsPrivateOrLoopback(match) {
+			return match
+		}
 		fake := d.pseudonymizer.GetOrCreate(match, true)
 		callback(match, "ipv6-address", "IPv6 Address")
+		return fake
+	})
+	content = d.ipv4.ReplaceAllStringFunc(content, func(match string) string {
+		if d.excludePrivateLoopback && ipMatchIsPrivateOrLoopback(match) {
+			return match
+		}
+		fake := d.pseudonymizer.GetOrCreate(match, false)
+		callback(match, "ipv4-address", "IPv4 Address")
 		return fake
 	})
 	return content
@@ -157,13 +204,13 @@ func (d *IPDetector) Redact(ctx context.Context, content string, callback Redact
 
 // Unredact replaces any fake IPs in content with the original real IPs.
 func (d *IPDetector) Unredact(content string) string {
-	content = d.ipv4.ReplaceAllStringFunc(content, func(match string) string {
-		if real, ok := d.pseudonymizer.Restore(match); ok {
+	content = d.ipv6.ReplaceAllStringFunc(content, func(key string) string {
+		if real, ok := d.pseudonymizer.Restore(key); ok {
 			return real
 		}
-		return match
+		return key
 	})
-	content = d.ipv6.ReplaceAllStringFunc(content, func(match string) string {
+	content = d.ipv4.ReplaceAllStringFunc(content, func(match string) string {
 		if real, ok := d.pseudonymizer.Restore(match); ok {
 			return real
 		}

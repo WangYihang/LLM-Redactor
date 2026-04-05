@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,54 @@ const (
 	RedactedPlaceholder = "REDACTED_SECRET"
 	eventChannelSize    = 1024
 )
+
+// schemaSubtreeEntry reports whether descending into mapKey starts a JSON Schema
+// payload (tool definitions, Responses API blocks, OpenAI function parameters).
+// All redaction must be skipped for string values inside this subtree: not only
+// IPs but Gitleaks/regex, email and URL pseudonyms, and same-length secret masks
+// can change const/enum/pattern/$ref text and make draft 2020-12 validation fail.
+func schemaSubtreeEntry(path []string, mapKey string) bool {
+	switch mapKey {
+	case "input_schema", "json_schema", "output_schema":
+		return true
+	case "parameters":
+		for i := len(path) - 1; i >= 0; i-- {
+			if path[i] == "function" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anthropicSignedThinkingBlock reports whether m is a Claude Messages API
+// content block whose signature is bound to the entire block. Redacting any
+// field (thinking text, signature, etc.) causes "Invalid `signature` in
+// `thinking` block" from the API. We only skip redaction when this block sits
+// under role=assistant (see redactValueJSON); user-supplied thinking-shaped
+// JSON is still redacted so PII cannot be smuggled in fake blocks.
+func anthropicSignedThinkingBlock(m map[string]interface{}) bool {
+	t, ok := m["type"].(string)
+	if !ok {
+		return false
+	}
+	switch t {
+	case "thinking", "redacted_thinking":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMessagesArrayElementPath(path []string) bool {
+	n := len(path)
+	return n >= 2 && path[n-2] == "messages" && path[n-1] == "*"
+}
+
+func messageHasAssistantRole(m map[string]interface{}) bool {
+	r, ok := m["role"].(string)
+	return ok && r == "assistant"
+}
 
 // detectionEvent captures all info needed to log a single detection asynchronously.
 type detectionEvent struct {
@@ -135,7 +184,7 @@ func New(configPath string, sysLog, detectionLog zerolog.Logger) (*Redactor, err
 	detectorsList := []detectors.Detector{
 		detectors.NewRegexDetector(regexRules),
 		detectors.NewDeepSeekDetector(),
-		detectors.NewIPDetector(),
+		detectors.NewIPDetector(config.ExcludePrivateIPsOrDefault()),
 		detectors.NewEmailDetector(),
 		detectors.NewGitProjectDetector(),
 		// Default threshold 4.3 to skip hex-only strings (max entropy 4.0)
@@ -234,6 +283,13 @@ func (r *Redactor) Close() {
 // to the background processor asynchronously.
 // Returns the redacted content and a boolean indicating if any redaction occurred.
 func (r *Redactor) RedactContent(ctx context.Context, content string) (string, bool) {
+	return r.redactContent(ctx, content, false)
+}
+
+func (r *Redactor) redactContent(ctx context.Context, content string, preserveLiterals bool) (string, bool) {
+	if preserveLiterals {
+		return content, false
+	}
 	anyRedacted := false
 	for _, detector := range r.detectors {
 		content = detector.Redact(ctx, content, func(match, ruleID, description string) string {
@@ -315,15 +371,30 @@ func (r *Redactor) GetStats() map[string]int64 {
 // RedactValue recursively traverses a JSON-compatible structure and redacts all string values.
 // Returns the redacted value and a boolean indicating if any redaction occurred.
 func (r *Redactor) RedactValue(ctx context.Context, v interface{}) (interface{}, bool) {
+	return r.redactValueJSON(ctx, v, false, false, false, nil)
+}
+
+func (r *Redactor) redactValueJSON(ctx context.Context, v interface{}, inJSONSchema, inAnthropicThinking, inAssistantMessage bool, path []string) (interface{}, bool) {
 	anyRedacted := false
 	switch val := v.(type) {
 	case string:
-		return r.RedactContent(ctx, val)
+		preserve := inJSONSchema || (inAnthropicThinking && inAssistantMessage)
+		return r.redactContent(ctx, val, preserve)
 	case map[string]interface{}:
-		for k, v := range val {
-			var redacted interface{}
-			var changed bool
-			redacted, changed = r.RedactValue(ctx, v)
+		inAsst := inAssistantMessage
+		if isMessagesArrayElementPath(path) {
+			if messageHasAssistantRole(val) {
+				inAsst = true
+			} else {
+				inAsst = false
+			}
+		}
+		thinkingHere := anthropicSignedThinkingBlock(val)
+		for k, child := range val {
+			nextSchema := inJSONSchema || schemaSubtreeEntry(path, k)
+			nextThinking := inAnthropicThinking || thinkingHere
+			childPath := append(slices.Clone(path), k)
+			redacted, changed := r.redactValueJSON(ctx, child, nextSchema, nextThinking, inAsst, childPath)
 			if changed {
 				val[k] = redacted
 				anyRedacted = true
@@ -331,10 +402,9 @@ func (r *Redactor) RedactValue(ctx context.Context, v interface{}) (interface{},
 		}
 		return val, anyRedacted
 	case []interface{}:
-		for i, v := range val {
-			var redacted interface{}
-			var changed bool
-			redacted, changed = r.RedactValue(ctx, v)
+		arrPath := append(slices.Clone(path), "*")
+		for i, child := range val {
+			redacted, changed := r.redactValueJSON(ctx, child, inJSONSchema, inAnthropicThinking, inAssistantMessage, arrPath)
 			if changed {
 				val[i] = redacted
 				anyRedacted = true
@@ -406,7 +476,7 @@ func (r *Redactor) RedactWebSocket(ctx context.Context, messageType websocket.Me
 			return redacted, changed, nil
 		}
 	}
-	redacted, changed := r.RedactContent(ctx, string(data))
+	redacted, changed := r.redactContent(ctx, string(data), false)
 	return []byte(redacted), changed, nil
 }
 
