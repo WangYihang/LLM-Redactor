@@ -170,9 +170,10 @@ func New(configPath string, sysLog, detectionLog zerolog.Logger) (*Redactor, err
 	var regexRules []detectors.RegexRule
 	for _, rule := range config.Rules {
 		regexRules = append(regexRules, detectors.RegexRule{
-			ID:          rule.ID,
-			Description: rule.Description,
-			Regex:       rule.Regex,
+			ID:            rule.ID,
+			Description:   rule.Description,
+			Regex:         rule.Regex,
+			ReplaceEngine: rule.ReplaceEngine,
 		})
 	}
 

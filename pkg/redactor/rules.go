@@ -6,10 +6,11 @@ import (
 
 // Rule matches the Gitleaks official TOML structure
 type Rule struct {
-	ID          string         `toml:"id" json:"id"`
-	Description string         `toml:"description" json:"description"`
-	Regex       *regexp.Regexp `toml:"-" json:"-"`
-	RawRegex    string         `toml:"regex" json:"regex"`
+	ID            string         `toml:"id" json:"id"`
+	Description   string         `toml:"description" json:"description"`
+	Regex         *regexp.Regexp `toml:"-" json:"-"`
+	RawRegex      string         `toml:"regex" json:"regex"`
+	ReplaceEngine string         `toml:"replace_engine" json:"replace_engine"`
 }
 
 type Config struct {

@@ -23,9 +23,10 @@ func newTestRedactorWithBuffer(rules []Rule, log zerolog.Logger, buffer int, sta
 	var regexRules []detectors.RegexRule
 	for _, rule := range rules {
 		regexRules = append(regexRules, detectors.RegexRule{
-			ID:          rule.ID,
-			Description: rule.Description,
-			Regex:       rule.Regex,
+			ID:            rule.ID,
+			Description:   rule.Description,
+			Regex:         rule.Regex,
+			ReplaceEngine: rule.ReplaceEngine,
 		})
 	}
 	r := &Redactor{
