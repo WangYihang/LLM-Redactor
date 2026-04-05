@@ -3,7 +3,9 @@ package redactor
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,54 @@ const (
 	RedactedPlaceholder = "REDACTED_SECRET"
 	eventChannelSize    = 1024
 )
+
+// schemaSubtreeEntry reports whether descending into mapKey starts a JSON Schema
+// payload (tool definitions, Responses API blocks, OpenAI function parameters).
+// All redaction must be skipped for string values inside this subtree: not only
+// IPs but Gitleaks/regex, email and URL pseudonyms, and same-length secret masks
+// can change const/enum/pattern/$ref text and make draft 2020-12 validation fail.
+func schemaSubtreeEntry(path []string, mapKey string) bool {
+	switch mapKey {
+	case "input_schema", "json_schema", "output_schema":
+		return true
+	case "parameters":
+		for i := len(path) - 1; i >= 0; i-- {
+			if path[i] == "function" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anthropicSignedThinkingBlock reports whether m is a Claude Messages API
+// content block whose signature is bound to the entire block. Redacting any
+// field (thinking text, signature, etc.) causes "Invalid `signature` in
+// `thinking` block" from the API. We only skip redaction when this block sits
+// under role=assistant (see redactValueJSON); user-supplied thinking-shaped
+// JSON is still redacted so PII cannot be smuggled in fake blocks.
+func anthropicSignedThinkingBlock(m map[string]interface{}) bool {
+	t, ok := m["type"].(string)
+	if !ok {
+		return false
+	}
+	switch t {
+	case "thinking", "redacted_thinking":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMessagesArrayElementPath(path []string) bool {
+	n := len(path)
+	return n >= 2 && path[n-2] == "messages" && path[n-1] == "*"
+}
+
+func messageHasAssistantRole(m map[string]interface{}) bool {
+	r, ok := m["role"].(string)
+	return ok && r == "assistant"
+}
 
 // detectionEvent captures all info needed to log a single detection asynchronously.
 type detectionEvent struct {
@@ -120,17 +170,29 @@ func New(configPath string, sysLog, detectionLog zerolog.Logger) (*Redactor, err
 	var regexRules []detectors.RegexRule
 	for _, rule := range config.Rules {
 		regexRules = append(regexRules, detectors.RegexRule{
-			ID:          rule.ID,
-			Description: rule.Description,
-			Regex:       rule.Regex,
+			ID:            rule.ID,
+			Description:   rule.Description,
+			Regex:         rule.Regex,
+			ReplaceEngine: rule.ReplaceEngine,
 		})
+	}
+
+	gitleaksDetector, err := detectors.NewGitleaksDetector()
+	if err != nil {
+		sysLog.Warn().Err(err).Msg("failed to initialise gitleaks native detector; skipping")
 	}
 
 	detectorsList := []detectors.Detector{
 		detectors.NewRegexDetector(regexRules),
 		detectors.NewDeepSeekDetector(),
+		detectors.NewIPDetector(config.ExcludePrivateIPsOrDefault()),
+		detectors.NewEmailDetector(),
+		detectors.NewGitProjectDetector(),
 		// Default threshold 4.3 to skip hex-only strings (max entropy 4.0)
-		detectors.NewEntropyDetector(4.3, 32),
+		// detectors.NewEntropyDetector(4.3, 32),
+	}
+	if gitleaksDetector != nil {
+		detectorsList = append(detectorsList, gitleaksDetector)
 	}
 
 	r := &Redactor{
@@ -222,6 +284,13 @@ func (r *Redactor) Close() {
 // to the background processor asynchronously.
 // Returns the redacted content and a boolean indicating if any redaction occurred.
 func (r *Redactor) RedactContent(ctx context.Context, content string) (string, bool) {
+	return r.redactContent(ctx, content, false)
+}
+
+func (r *Redactor) redactContent(ctx context.Context, content string, preserveLiterals bool) (string, bool) {
+	if preserveLiterals {
+		return content, false
+	}
 	anyRedacted := false
 	for _, detector := range r.detectors {
 		content = detector.Redact(ctx, content, func(match, ruleID, description string) string {
@@ -303,15 +372,30 @@ func (r *Redactor) GetStats() map[string]int64 {
 // RedactValue recursively traverses a JSON-compatible structure and redacts all string values.
 // Returns the redacted value and a boolean indicating if any redaction occurred.
 func (r *Redactor) RedactValue(ctx context.Context, v interface{}) (interface{}, bool) {
+	return r.redactValueJSON(ctx, v, false, false, false, nil)
+}
+
+func (r *Redactor) redactValueJSON(ctx context.Context, v interface{}, inJSONSchema, inAnthropicThinking, inAssistantMessage bool, path []string) (interface{}, bool) {
 	anyRedacted := false
 	switch val := v.(type) {
 	case string:
-		return r.RedactContent(ctx, val)
+		preserve := inJSONSchema || (inAnthropicThinking && inAssistantMessage)
+		return r.redactContent(ctx, val, preserve)
 	case map[string]interface{}:
-		for k, v := range val {
-			var redacted interface{}
-			var changed bool
-			redacted, changed = r.RedactValue(ctx, v)
+		inAsst := inAssistantMessage
+		if isMessagesArrayElementPath(path) {
+			if messageHasAssistantRole(val) {
+				inAsst = true
+			} else {
+				inAsst = false
+			}
+		}
+		thinkingHere := anthropicSignedThinkingBlock(val)
+		for k, child := range val {
+			nextSchema := inJSONSchema || schemaSubtreeEntry(path, k)
+			nextThinking := inAnthropicThinking || thinkingHere
+			childPath := append(slices.Clone(path), k)
+			redacted, changed := r.redactValueJSON(ctx, child, nextSchema, nextThinking, inAsst, childPath)
 			if changed {
 				val[k] = redacted
 				anyRedacted = true
@@ -319,10 +403,9 @@ func (r *Redactor) RedactValue(ctx context.Context, v interface{}) (interface{},
 		}
 		return val, anyRedacted
 	case []interface{}:
-		for i, v := range val {
-			var redacted interface{}
-			var changed bool
-			redacted, changed = r.RedactValue(ctx, v)
+		arrPath := append(slices.Clone(path), "*")
+		for i, child := range val {
+			redacted, changed := r.redactValueJSON(ctx, child, inJSONSchema, inAnthropicThinking, inAssistantMessage, arrPath)
 			if changed {
 				val[i] = redacted
 				anyRedacted = true
@@ -355,6 +438,33 @@ func (r *Redactor) RedactRequest(ctx context.Context, body []byte) ([]byte, bool
 	return res, true, err
 }
 
+// UnredactContent restores previously pseudonymized values (e.g. fake IPs back
+// to real IPs) in a single string. Only detectors that implement the
+// Unredactor interface participate.
+func (r *Redactor) UnredactContent(content string) string {
+	for _, d := range r.detectors {
+		if u, ok := d.(detectors.Unredactor); ok {
+			content = u.Unredact(content)
+		}
+	}
+	return content
+}
+
+// UnredactResponse restores pseudonymized values in a JSON response body.
+// Returns the restored body (and true) only when at least one substitution
+// was made; otherwise returns the original body unchanged.
+func (r *Redactor) UnredactResponse(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 {
+		return body, false, nil
+	}
+
+	restored := r.UnredactContent(string(body))
+	if restored == string(body) {
+		return body, false, nil
+	}
+	return []byte(restored), true, nil
+}
+
 // RedactWebSocket redacts WebSocket messages.
 func (r *Redactor) RedactWebSocket(ctx context.Context, messageType websocket.MessageType, data []byte) ([]byte, bool, error) {
 	if messageType != websocket.MessageText {
@@ -367,8 +477,62 @@ func (r *Redactor) RedactWebSocket(ctx context.Context, messageType websocket.Me
 			return redacted, changed, nil
 		}
 	}
-	redacted, changed := r.RedactContent(ctx, string(data))
+	redacted, changed := r.redactContent(ctx, string(data), false)
 	return []byte(redacted), changed, nil
 }
 
-// StreamRedactor implements a sliding window redactor for SSE streams
+// streamUnredactReader wraps an io.ReadCloser and restores pseudonymized
+// values (e.g. fake IPs → real IPs) in each chunk as it is read. It handles
+// the case where the restored text is longer than the incoming chunk by keeping
+// an internal overflow buffer that is drained on the next Read call.
+//
+// Cross-chunk boundary splits: SSE/NDJSON chunks are typically 50–500 bytes
+// and fake IP tokens are at most ~20 chars, so splits are extremely unlikely.
+// If one does occur the token is left as-is in that response.
+type streamUnredactReader struct {
+	r        io.ReadCloser
+	unredact func(string) string
+	overflow []byte
+}
+
+func (s *streamUnredactReader) Read(p []byte) (int, error) {
+	// Drain the overflow buffer before reading more data.
+	if len(s.overflow) > 0 {
+		n := copy(p, s.overflow)
+		s.overflow = s.overflow[n:]
+		return n, nil
+	}
+
+	n, err := s.r.Read(p)
+	if n == 0 {
+		return 0, err
+	}
+
+	restored := []byte(s.unredact(string(p[:n])))
+	if len(restored) <= len(p) {
+		copy(p, restored)
+		return len(restored), err
+	}
+
+	// Restored content is larger than the caller's buffer: return what fits
+	// and keep the rest for the next Read.
+	copy(p, restored[:len(p)])
+	s.overflow = append(s.overflow[:0], restored[len(p):]...)
+	return len(p), err
+}
+
+func (s *streamUnredactReader) Close() error {
+	return s.r.Close()
+}
+
+// WrapStreamUnredactor wraps body so that pseudonymized values are restored
+// as the stream is consumed. Safe to call with a nil body (returns nil).
+func (r *Redactor) WrapStreamUnredactor(body io.ReadCloser) io.ReadCloser {
+	if body == nil {
+		return nil
+	}
+	return &streamUnredactReader{
+		r:        body,
+		unredact: r.UnredactContent,
+	}
+}
